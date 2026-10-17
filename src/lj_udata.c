@@ -49,6 +49,8 @@ GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
     GCRef *head = a ? &gwfin(a)->b->nextgc : &mainthread(g)->nextgc;
     setgcrefr(ud->nextgc, *head);
     setgcref(*head, obj2gco(ud));
+    /* The creation stamp: the finalization order of the finobj lists. */
+    gwudstamp(ud) = a ? ++gwfin(a)->stamp : 0;
   }
   if (LJ_UNLIKELY(udata_gw_hook != NULL))
     udata_gw_hook(L, uddata(ud), (size_t)sz);  /* GlobalWar, off by default. */

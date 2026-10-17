@@ -65,12 +65,22 @@ enum {
 ** the sweep, lj_gc_freeall() and lj_gc_separateudata(g, 1) see everything.
 ** A metatable without __gc of a plain userdata is watched (GCgwfin.mt): if
 ** __gc is added to it later, the next atomic phase walks the plain list too.
+**
+** Finalization order (Lua 5.1: reverse order of creation, as upstream): with
+** the anchors every userdata gets a creation stamp (GCudata.align1, unused
+** upstream), both lists stay sorted newest first. A userdata moved into the
+** finobj list later (sweep, full walk) is inserted by its stamp, and a walk
+** of both lists (mode 0, the full walk, lua_close) merges them by stamp.
 */
 #define LJ_GW_UDTYPE_ANCHOR	UDTYPE__MAX	/* udtype of the anchors. */
 #define LJ_GW_UD_FINOBJ		0x01	/* GCudata.unused2: in the finobj list. */
 #define LJ_GW_UD_PENDING	0x02	/* Has __gc, waits in the plain list. */
 #define LJ_GC_GW_MTWATCH	0x80	/* GCtab.marked: in GCgwfin.mt. */
 #define gwudflags(u)		((u)->unused2)
+#define gwudstamp(u)		((u)->align1)
+/* Userdata x was made after y (stamps of 32 bits, compared with wrap). */
+#define gc_gw_newer(x, y) \
+  ((int32_t)(gwudstamp(gco2ud(x)) - gwudstamp(gco2ud(y))) > 0)
 
 typedef struct GCgwfin {
   GCudata *b;		/* Anchor B: the end of the finobj list. */
@@ -81,6 +91,8 @@ typedef struct GCgwfin {
   GCtab **mt;
   MSize npend, szpend;	/* Udata flagged PENDING since the last atomic. */
   GCudata **pend;
+  uint32_t stamp;	/* The creation stamp of the newest userdata. */
+  GCRef *sweepins;	/* Sweep: where the last PENDING one was put. */
   /* Counters since the anchors were made (luaJIT_gw_finobj_stats). */
   uint64_t moved_head;	/* Moved by lua_setmetatable(): the plain head. */
   uint64_t pending;	/* Flagged PENDING (not the head). */
