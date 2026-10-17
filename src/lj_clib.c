@@ -405,6 +405,7 @@ static CLibrary *clib_new(lua_State *L, GCtab *mt)
   ud->udtype = UDTYPE_FFI_CLIB;
   /* NOBARRIER: The GCudata is new (marked white). */
   setgcref(ud->metatable, obj2gco(mt));
+  lj_gc_gw_udmeta(L, ud);  /* GlobalWar: the finobj list (lj_gc.h). */
   setudataV(L, L->top++, ud);
   return cl;
 }

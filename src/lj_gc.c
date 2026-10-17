@@ -139,13 +139,34 @@ static void gc_mark_mmudata(global_State *g)
   }
 }
 
-/* Separate userdata objects to be finalized to mmudata list. */
-size_t lj_gc_separateudata(global_State *g, int all)
+/* Link userdata to the end of the mmudata list (it is unlinked already). */
+static void gc_link_mmudata(global_State *g, GCobj *o)
+{
+  if (gcref(g->gc.mmudata)) {  /* Link to end of mmudata list. */
+    GCobj *root = gcref(g->gc.mmudata);
+    setgcrefr(o->gch.nextgc, root->gch.nextgc);
+    setgcref(root->gch.nextgc, o);
+    setgcref(g->gc.mmudata, o);
+  } else {  /* Create circular list. */
+    setgcref(o->gch.nextgc, o);
+    setgcref(g->gc.mmudata, o);
+  }
+}
+
+/* GlobalWar: what a walk over a userdata list saw. */
+typedef struct GCgwwalk {
+  size_t objs, white, gc;  /* Udata walked, found white, moved to mmudata. */
+} GCgwwalk;
+
+/* Separate userdata to be finalized to mmudata list: from *p up to end. */
+static size_t gc_separate_list(global_State *g, GCRef *p, GCobj *end,
+			       int all, GCgwwalk *w)
 {
   size_t m = 0;
-  GCRef *p = &mainthread(g)->nextgc;
   GCobj *o;
-  while ((o = gcref(*p)) != NULL) {
+  while ((o = gcref(*p)) != end) {
+    w->objs++;
+    if (iswhite(o)) w->white++;
     if (!(iswhite(o) || all) || isfinalized(gco2ud(o))) {
       p = &o->gch.nextgc;  /* Nothing to do. */
     } else if (!lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc)) {
@@ -153,20 +174,246 @@ size_t lj_gc_separateudata(global_State *g, int all)
       p = &o->gch.nextgc;
     } else {  /* Otherwise move userdata to be finalized to mmudata list. */
       m += sizeudata(gco2ud(o));
+      w->gc++;
       markfinalized(o);
       *p = o->gch.nextgc;
-      if (gcref(g->gc.mmudata)) {  /* Link to end of mmudata list. */
-	GCobj *root = gcref(g->gc.mmudata);
-	setgcrefr(o->gch.nextgc, root->gch.nextgc);
-	setgcref(root->gch.nextgc, o);
-	setgcref(g->gc.mmudata, o);
-      } else {  /* Create circular list. */
-	setgcref(o->gch.nextgc, o);
-	setgcref(g->gc.mmudata, o);
-      }
+      gc_link_mmudata(g, o);
     }
   }
   return m;
+}
+
+/* Separate userdata objects to be finalized to mmudata list. */
+size_t lj_gc_separateudata(global_State *g, int all)
+{
+  GCgwwalk w = {0, 0, 0};
+  /* All userdata, both lists of luaJIT_gw_finobj() included. */
+  return gc_separate_list(g, &mainthread(g)->nextgc, NULL, all, &w);
+}
+
+/* -- GlobalWar: the finobj list (see lj_gc.h) ----------------------------- */
+
+/* Grow a vector of pointers without raising an error. NULL: out of memory
+** (the vector is unchanged), else the new one.
+*/
+static void *gc_gw_grow(global_State *g, void *v, MSize *sz)
+{
+  MSize nsz = *sz ? *sz * 2 : 64;
+  void *p = g->allocf(g->allocd, v, *sz * sizeof(void *), nsz * sizeof(void *));
+  if (p == NULL) return NULL;
+  g->gc.total = (g->gc.total - *sz * sizeof(void *)) + nsz * sizeof(void *);
+  *sz = nsz;
+  return p;
+}
+
+/* Watch a metatable without __gc of a plain userdata. 0: out of memory. */
+static int gc_gw_watchmt(global_State *g, GCgwfin *f, GCtab *mt)
+{
+  if ((mt->marked & LJ_GC_GW_MTWATCH)) return 1;
+  if (f->nmt == f->szmt) {
+    GCtab **v = (GCtab **)gc_gw_grow(g, f->mt, &f->szmt);
+    if (v == NULL) return 0;
+    f->mt = v;
+  }
+  f->mt[f->nmt++] = mt;
+  mt->marked |= LJ_GC_GW_MTWATCH;
+  f->watched++;
+  return 1;
+}
+
+/* Flag a plain udata with __gc for the next sweep. 0: out of memory. */
+static int gc_gw_addpend(global_State *g, GCgwfin *f, GCudata *ud)
+{
+  if (f->npend == f->szpend) {
+    GCudata **v = (GCudata **)gc_gw_grow(g, f->pend, &f->szpend);
+    if (v == NULL) return 0;
+    f->pend = v;
+  }
+  f->pend[f->npend++] = ud;
+  gwudflags(ud) = LJ_GW_UD_PENDING;
+  f->pending++;
+  return 1;
+}
+
+/* Stop watching all metatables. */
+static void gc_gw_unwatchall(GCgwfin *f)
+{
+  MSize i;
+  for (i = 0; i < f->nmt; i++)
+    f->mt[i]->marked &= (uint8_t)~LJ_GC_GW_MTWATCH;
+  f->nmt = 0;
+}
+
+/* Move userdata o (*p == o) to the head of the finobj list. */
+static void gc_gw_tofinobj(GCudata *a, GCRef *p, GCobj *o)
+{
+  setgcrefr(*p, o->gch.nextgc);  /* Unlink. */
+  setgcrefr(o->gch.nextgc, a->nextgc);
+  setgcref(a->nextgc, o);
+  gwudflags(gco2ud(o)) = LJ_GW_UD_FINOBJ;
+}
+
+/* A userdata got a metatable (lua_setmetatable() and the libraries). */
+void lj_gc_gw_udmeta(lua_State *L, GCudata *ud)
+{
+  global_State *g = G(L);
+  GCudata *a = gc_gw_anchor(g);
+  GCgwfin *f;
+  GCtab *mt;
+  if (a == NULL || !(f = gwfin(a))->mode || isfinalized(ud) ||
+      (gwudflags(ud) & (LJ_GW_UD_FINOBJ|LJ_GW_UD_PENDING)))
+    return;  /* Off, never finalized again, or in the finobj list already. */
+  mt = tabref(ud->metatable);
+  if (mt == NULL)
+    return;  /* The hook sees the metatable it may get later. */
+  if (lj_meta_fastg(g, mt, MM_gc)) {
+    GCobj *o = obj2gco(ud);
+    GCRef *p = &f->b->nextgc;
+    if (gcref(*p) == o) {  /* The head of the plain list: move it now. */
+      /* The sweep may be right at it: let it go on with the next one. */
+      if (mref(g->gc.sweep, GCRef) == &o->gch.nextgc)
+	setmref(g->gc.sweep, p);
+      gc_gw_tofinobj(a, p, o);
+      /* The finobj list may be swept already: no black objects after it. */
+      if (g->gc.state == GCSsweepstring || g->gc.state == GCSsweep)
+	makewhite(g, o);
+      f->moved_head++;
+    } else if (gc_gw_addpend(g, f, ud)) {
+      /* The next sweep moves it (gc_sweep). */
+    } else {
+      f->dirty = 1;  /* Out of memory: the next atomic walks all. */
+      f->oom++;
+    }
+  } else if (!gc_gw_watchmt(g, f, mt)) {
+    f->dirty = 1;
+    f->oom++;
+  }
+}
+
+/* lj_udata_free() of an anchor. */
+void lj_gc_gw_freeanchor(global_State *g, GCudata *ud)
+{
+  if (ud->len == sizeof(GCgwfin)) {  /* A: free its vectors. */
+    GCgwfin *f = gwfin(ud);
+    if (f->szmt) lj_mem_freevec(g, f->mt, f->szmt, GCtab *);
+    if (f->szpend) lj_mem_freevec(g, f->pend, f->szpend, GCudata *);
+  }
+}
+
+/* The plain list when it may hold udata with __gc: as gc_separate_list(),
+** and a live one with __gc moves to the finobj list, the metatables of the
+** others are watched again.
+*/
+static size_t gc_gw_walkplain(global_State *g, GCudata *a, GCgwwalk *w,
+			      size_t *moved)
+{
+  GCgwfin *f = gwfin(a);
+  GCRef *p = &f->b->nextgc;
+  size_t m = 0;
+  GCobj *o;
+  while ((o = gcref(*p)) != NULL) {
+    GCudata *ud = gco2ud(o);
+    GCtab *mt = tabref(ud->metatable);
+    w->objs++;
+    if (isfinalized(ud)) {
+      if (iswhite(o)) w->white++;
+      p = &o->gch.nextgc;  /* Nothing to do. */
+    } else if (iswhite(o)) {
+      w->white++;
+      gwudflags(ud) = 0;
+      if (!lj_meta_fastg(g, mt, MM_gc)) {
+	markfinalized(o);  /* Done, as there's no __gc metamethod. */
+	p = &o->gch.nextgc;
+      } else {  /* Otherwise move userdata to be finalized to mmudata list. */
+	m += sizeudata(ud);
+	w->gc++;
+	markfinalized(o);
+	*p = o->gch.nextgc;
+	gc_link_mmudata(g, o);
+      }
+    } else if (lj_meta_fastg(g, mt, MM_gc)) {
+      gc_gw_tofinobj(a, p, o);  /* Live with __gc: to the finobj list. */
+      (*moved)++;
+    } else {
+      gwudflags(ud) = 0;
+      if (mt && !gc_gw_watchmt(g, f, mt)) {
+	f->dirty = 1;  /* Out of memory: walk all again next time. */
+	f->oom++;
+      }
+      p = &o->gch.nextgc;
+    }
+  }
+  return m;
+}
+
+/* GlobalWar: what gc_separate_atomic() did. */
+typedef struct GCgwsep {
+  GCgwwalk fin, plain;	/* The finobj list; the plain list (mode 0: all). */
+  int mode, full;	/* full: 1 forced, 2 a watched metatable got __gc. */
+  size_t moved;		/* Full walk: live udata moved to the finobj list. */
+  size_t pending, kept;	/* PENDING udata; of them white, kept a cycle. */
+} GCgwsep;
+
+/* lj_gc_separateudata(g, 0) of the atomic phase. */
+static size_t gc_separate_atomic(global_State *g, GCgwsep *s)
+{
+  GCudata *a = gc_gw_anchor(g);
+  GCgwfin *f;
+  size_t m;
+  MSize i;
+  if (a == NULL || !(f = gwfin(a))->mode)  /* All userdata, as upstream. */
+    return gc_separate_list(g, &mainthread(g)->nextgc, NULL, 0, &s->plain);
+  s->mode = 1;
+  s->pending = f->npend;
+  if (f->dirty) {
+    s->full = 1;
+  } else {
+    for (i = 0; i < f->nmt; i++)  /* Did a watched metatable get __gc? */
+      if (lj_meta_fastg(g, f->mt[i], MM_gc)) {
+	s->full = 2;
+	break;
+      }
+  }
+  m = gc_separate_list(g, &a->nextgc, obj2gco(f->b), 0, &s->fin);
+  if (s->full) {
+    gc_gw_unwatchall(f);  /* The walk watches the metatables again. */
+    f->dirty = 0;
+    f->full_walks++;
+    if (s->full == 2) f->full_mt++;
+    m += gc_gw_walkplain(g, a, &s->plain, &s->moved);
+    f->moved_full += s->moved;
+  } else {
+    for (i = 0; i < f->npend; i++) {
+      GCobj *o = obj2gco(f->pend[i]);
+      /* Unreachable, but its __gc needs the finobj list: keep it for one
+      ** more cycle, the sweep moves it there.
+      */
+      if ((gwudflags(gco2ud(o)) & LJ_GW_UD_PENDING) && iswhite(o)) {
+	gc_mark(g, o);
+	s->kept++;
+      }
+    }
+    f->kept += s->kept;
+  }
+  f->npend = 0;  /* The sweep after this atomic phase moves them all. */
+  return m;
+}
+
+/* After all marking: stop watching the metatables about to be freed. */
+static void gc_gw_prunemt(global_State *g)
+{
+  GCudata *a = gc_gw_anchor(g);
+  GCgwfin *f;
+  MSize i, j;
+  if (a == NULL || !(f = gwfin(a))->mode) return;
+  for (i = j = 0; i < f->nmt; i++) {
+    GCtab *mt = f->mt[i];
+    if (iswhite(obj2gco(mt)) && !(mt->marked & LJ_GC_FIXED))
+      mt->marked &= (uint8_t)~LJ_GC_GW_MTWATCH;
+    else
+      f->mt[j++] = mt;
+  }
+  f->nmt = j;
 }
 
 /* -- Propagation phase --------------------------------------------------- */
@@ -435,6 +682,18 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
       lj_assertG(!isdead(g, o) || (o->gch.marked & LJ_GC_FIXED),
 		 "sweep of undead object");
       makewhite(g, o);  /* Value is alive, change to the current white. */
+      if (LJ_UNLIKELY(o->gch.gct == ~LJ_TUDATA) &&
+	  LJ_UNLIKELY(gwudflags(gco2ud(o)) & LJ_GW_UD_PENDING)) {
+	/* GlobalWar: a plain udata with __gc. p is in the plain list, so the
+	** finobj list before it is swept already: move it there.
+	*/
+	GCudata *a = gc_gw_anchor(g);
+	if (a) {
+	  gc_gw_tofinobj(a, p, o);
+	  gwfin(a)->moved_sweep++;
+	  continue;
+	}
+      }
       p = &o->gch.nextgc;
     } else {  /* Otherwise value is dead, free it. */
       lj_assertG(isdead(g, o) || ow == LJ_GC_SFIXED,
@@ -554,8 +813,14 @@ static void gc_finalize(lua_State *L)
   }
 #endif
   /* Add userdata back to the main userdata list and make it white. */
-  setgcrefr(o->gch.nextgc, mainthread(g)->nextgc);
-  setgcref(mainthread(g)->nextgc, o);
+  {
+    /* GlobalWar: finalized, so to the plain list of luaJIT_gw_finobj(). */
+    GCudata *a = gc_gw_anchor(g);
+    GCRef *head = a ? &gwfin(a)->b->nextgc : &mainthread(g)->nextgc;
+    setgcrefr(o->gch.nextgc, *head);
+    setgcref(*head, o);
+    gwudflags(gco2ud(o)) = 0;
+  }
   makewhite(g, o);
   /* Resolve the __gc metamethod. */
   mo = lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc);
@@ -638,37 +903,24 @@ static size_t gc_gw_propagate(global_State *g, luaJIT_gw_gcpart *p)
   return m;
 }
 
-/* lj_gc_separateudata(g, 0) that counts the userdata it walks. */
+/* gc_separate_atomic() that reports what it walked. */
 static size_t gc_gw_separateudata(global_State *g, luaJIT_gw_atomic *s)
 {
-  size_t m = 0;
-  GCRef *p = &mainthread(g)->nextgc;
-  GCobj *o;
-  while ((o = gcref(*p)) != NULL) {
-    s->separate.objs++;
-    if (iswhite(o)) s->ud_white++;
-    if (!iswhite(o) || isfinalized(gco2ud(o))) {
-      p = &o->gch.nextgc;  /* Nothing to do. */
-    } else if (!lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc)) {
-      markfinalized(o);  /* Done, as there's no __gc metamethod. */
-      p = &o->gch.nextgc;
-    } else {  /* Otherwise move userdata to be finalized to mmudata list. */
-      m += sizeudata(gco2ud(o));
-      s->ud_gc++;
-      markfinalized(o);
-      *p = o->gch.nextgc;
-      if (gcref(g->gc.mmudata)) {  /* Link to end of mmudata list. */
-	GCobj *root = gcref(g->gc.mmudata);
-	setgcrefr(o->gch.nextgc, root->gch.nextgc);
-	setgcref(root->gch.nextgc, o);
-	setgcref(g->gc.mmudata, o);
-      } else {  /* Create circular list. */
-	setgcref(o->gch.nextgc, o);
-	setgcref(g->gc.mmudata, o);
-      }
-    }
-  }
+  GCgwsep sep;
+  size_t m;
+  memset(&sep, 0, sizeof(sep));
+  m = gc_separate_atomic(g, &sep);
+  s->separate.objs = sep.fin.objs + sep.plain.objs;
+  s->ud_white = sep.fin.white + sep.plain.white;
+  s->ud_gc = sep.fin.gc + sep.plain.gc;
   s->separate.bytes = m;
+  s->fin_mode = sep.mode;
+  s->fin_full = sep.full;
+  s->fin_walked = sep.fin.objs;
+  s->plain_walked = sep.plain.objs;
+  s->fin_moved = sep.moved;
+  s->fin_pending = sep.pending;
+  s->fin_kept = sep.kept;
   return m;
 }
 
@@ -766,6 +1018,11 @@ static void atomic_gw(global_State *g, lua_State *L, luaJIT_gw_atomic *st)
   gc_mark_mmudata(g);  /* Mark them. */
   udsize += gc_gw_propagate(g, &s.mmudata);  /* And propagate the marks. */
   t2 = clk(); s.mmudata.t = t2 - t1;
+  gc_gw_prunemt(g);  /* GlobalWar: unwatch the dead metatables. */
+  {
+    GCudata *a = gc_gw_anchor(g);
+    s.fin_mts = (a && gwfin(a)->mode) ? gwfin(a)->nmt : 0;
+  }
 
   /* All marking done, clear weak tables. */
   gc_gw_clearweak(g, gcref(g->gc.weak), &s);
@@ -881,14 +1138,32 @@ LUA_API void luaJIT_gw_census(lua_State *L, luaJIT_gw_heap *out,
 			      void *ctx)
 {
   global_State *g = G(L);
+  GCudata *a = gc_gw_anchor(g);
+  int seg = 0;  /* 1: in the finobj list, 0/2: in the plain one. */
   GCobj *o;
   MSize i;
   memset(out, 0, sizeof(*out));
   out->total = (size_t)g->gc.total;
   out->gcstate = g->gc.state;
   /* All objects but strings and open upvalues; userdata after the main thread. */
-  for (o = gcref(g->gc.root); o; o = gcref(o->gch.nextgc))
+  for (o = gcref(g->gc.root); o; o = gcref(o->gch.nextgc)) {
+    if (a && o == obj2gco(a)) {  /* The anchors of luaJIT_gw_finobj(). */
+      seg = 1;
+      continue;
+    } else if (a && o == obj2gco(gwfin(a)->b)) {
+      seg = 2;
+      continue;
+    }
+    if (o->gch.gct == ~LJ_TUDATA && !isdead(g, o)) {
+      if (seg == 1) out->ud_finobj++; else out->ud_plain++;
+      if ((gwudflags(gco2ud(o)) & LJ_GW_UD_PENDING)) out->ud_pending++;
+    }
     gc_gw_census_obj(g, o, out, ud, tab, ctx);
+  }
+  if (a) {
+    out->finobj_mode = gwfin(a)->mode;
+    out->fin_mts = gwfin(a)->nmt;
+  }
   for (i = 0; i <= g->strmask; i++)  /* Strings: the hash chains. */
     for (o = gcref(g->strhash[i]); o; o = gcref(o->gch.nextgc))
       gc_gw_census_obj(g, o, out, ud, tab, ctx);
@@ -918,6 +1193,99 @@ LUA_API size_t luaJIT_gw_objsize(lua_State *L, int idx)
   return tvisgcv(o) ? gc_gw_objsize(gcV(o)) : 0;
 }
 
+/* -- GlobalWar: the finobj list switch (see lj_gc.h, luajit.h) ----------- */
+
+/* Make anchors A and B right after the main thread. NULL: out of memory. */
+static GCudata *gc_gw_newanchors(global_State *g)
+{
+  GCSize sa = sizeof(GCudata) + sizeof(GCgwfin), sb = sizeof(GCudata);
+  GCudata *a = (GCudata *)g->allocf(g->allocd, NULL, 0, sa);
+  GCudata *b;
+  GCudata *u[2];
+  int i;
+  if (a == NULL) return NULL;
+  b = (GCudata *)g->allocf(g->allocd, NULL, 0, sb);
+  if (b == NULL) {
+    g->allocf(g->allocd, a, sa, 0);
+    return NULL;
+  }
+  g->gc.total += sa + sb;
+  u[0] = a; u[1] = b;
+  for (i = 0; i < 2; i++) {
+    /* Fixed: the sweep keeps them, lj_gc_freeall() frees them. Never marked
+    ** (unreachable from Lua): no metatable, no environment.
+    */
+    newwhite(g, u[i]);
+    u[i]->marked |= LJ_GC_FIXED;
+    u[i]->gct = ~LJ_TUDATA;
+    u[i]->udtype = LJ_GW_UDTYPE_ANCHOR;
+    gwudflags(u[i]) = 0;
+    u[i]->len = i ? 0 : sizeof(GCgwfin);
+    setgcrefnull(u[i]->metatable);
+    setgcrefnull(u[i]->env);
+  }
+  memset(gwfin(a), 0, sizeof(GCgwfin));
+  gwfin(a)->b = b;
+  /* mainthread -> A -> B -> (the userdata so far: the plain list). The sweep
+  ** may stand at &mainthread->nextgc: then A and B are next, both alive.
+  */
+  setgcrefr(b->nextgc, mainthread(g)->nextgc);
+  setgcref(a->nextgc, obj2gco(b));
+  setgcref(mainthread(g)->nextgc, obj2gco(a));
+  return a;
+}
+
+LUA_API int luaJIT_gw_finobj(lua_State *L, int mode)
+{
+  global_State *g = G(L);
+  GCudata *a = gc_gw_anchor(g);
+  GCgwfin *f;
+  if (mode < 0)  /* Query. */
+    return a ? gwfin(a)->mode : 0;
+  if (mode) {
+    if (a == NULL && (a = gc_gw_newanchors(g)) == NULL)
+      return -1;  /* Out of memory: stays off. */
+    f = gwfin(a);
+    if (!f->mode) {
+      f->mode = 1;
+      f->dirty = 1;  /* The plain list may hold udata with __gc. */
+    }
+    return 1;
+  }
+  if (a) {  /* Off: atomic walks all userdata again, as upstream. */
+    f = gwfin(a);
+    f->mode = 0;
+    gc_gw_unwatchall(f);
+    f->npend = 0;  /* PENDING udata stay: the sweep still moves them. */
+    f->dirty = 1;
+  }
+  return 0;
+}
+
+LUA_API void luaJIT_gw_finobj_stats(lua_State *L, luaJIT_gw_finobj_info *out)
+{
+  global_State *g = G(L);
+  GCudata *a = gc_gw_anchor(g);
+  memset(out, 0, sizeof(*out));
+  if (a) {
+    GCgwfin *f = gwfin(a);
+    out->anchors = 1;
+    out->mode = f->mode;
+    out->dirty = f->dirty;
+    out->watched_now = f->nmt;
+    out->pending_now = f->npend;
+    out->moved_head = f->moved_head;
+    out->pending = f->pending;
+    out->moved_sweep = f->moved_sweep;
+    out->moved_full = f->moved_full;
+    out->full_walks = f->full_walks;
+    out->full_mt = f->full_mt;
+    out->watched = f->watched;
+    out->kept = f->kept;
+    out->oom = f->oom;
+  }
+}
+
 /* -- Collector ----------------------------------------------------------- */
 
 /* Atomic part of the GC cycle, transitioning from mark to sweep phase. */
@@ -944,9 +1312,14 @@ static void atomic(global_State *g, lua_State *L)
   setgcrefnull(g->gc.grayagain);
   gc_propagate_gray(g);  /* Propagate it. */
 
-  udsize = lj_gc_separateudata(g, 0);  /* Separate userdata to be finalized. */
+  {  /* Separate userdata to be finalized. */
+    GCgwsep sep;  /* GlobalWar: the finobj list, see lj_gc.h. */
+    memset(&sep, 0, sizeof(sep));
+    udsize = gc_separate_atomic(g, &sep);
+  }
   gc_mark_mmudata(g);  /* Mark them. */
   udsize += gc_propagate_gray(g);  /* And propagate the marks. */
+  gc_gw_prunemt(g);  /* GlobalWar: unwatch the dead metatables. */
 
   /* All marking done, clear weak tables. */
   gc_clearweak(g, gcref(g->gc.weak));

@@ -1114,6 +1114,7 @@ LUA_API int lua_setmetatable(lua_State *L, int idx)
     setgcref(udataV(o)->metatable, obj2gco(mt));
     if (mt)
       lj_gc_objbarrier(L, udataV(o), mt);
+    lj_gc_gw_udmeta(L, udataV(o));  /* GlobalWar: the finobj list. */
   } else {
     /* Flush cache, since traces specialize to basemt. But not during __gc. */
     if (lj_trace_flushall(L))

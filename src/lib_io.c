@@ -75,6 +75,7 @@ static IOFileUD *io_file_new(lua_State *L)
   ud->udtype = UDTYPE_IO_FILE;
   /* NOBARRIER: The GCudata is new (marked white). */
   setgcrefr(ud->metatable, curr_func(L)->c.env);
+  lj_gc_gw_udmeta(L, ud);  /* GlobalWar: the finobj list (lj_gc.h). */
   iof->fp = NULL;
   iof->type = IOFILE_TYPE_FILE;
   return iof;
@@ -525,6 +526,7 @@ static GCobj *io_std_new(lua_State *L, FILE *fp, const char *name)
   ud->udtype = UDTYPE_IO_FILE;
   /* NOBARRIER: The GCudata is new (marked white). */
   setgcref(ud->metatable, gcV(L->top-3));
+  lj_gc_gw_udmeta(L, ud);  /* GlobalWar: the finobj list (lj_gc.h). */
   iof->fp = fp;
   iof->type = IOFILE_TYPE_STDF;
   lua_setfield(L, -2, name);

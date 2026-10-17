@@ -122,6 +122,19 @@ typedef struct luaJIT_gw_atomic {
   size_t strnum, strslots;	/* Interned strings, string hash slots. */
   size_t mainstack, curstack;	/* Stack slots of the main/running thread. */
   size_t total, estimate;	/* Heap bytes before, estimate after. */
+  /* The finobj list (luaJIT_gw_finobj). separate.objs = fin + plain. */
+  int fin_mode;			/* 0: all udata walked (upstream), 1: finobj. */
+  int fin_full;			/* 1: the plain list walked too (switched on,
+				** out of memory), 2: a watched metatable got
+				** __gc. */
+  size_t fin_walked;		/* Udata walked in the finobj list. */
+  size_t plain_walked;		/* In the plain list (mode 0: all udata). */
+  size_t fin_moved;		/* That walk: live udata with __gc moved. */
+  size_t fin_pending;		/* Udata with __gc in the plain list (not the
+				** head at lua_setmetatable): the sweep moves
+				** them. */
+  size_t fin_kept;		/* Of them unreachable: kept for a cycle. */
+  size_t fin_mts;		/* Metatables without __gc watched. */
 } luaJIT_gw_atomic;
 
 /* st != NULL: record every atomic phase of the state of L into *st (time by
@@ -144,6 +157,11 @@ typedef struct luaJIT_gw_heap {
   size_t finalize, finalize_bytes;  /* Waiting for __gc. */
   size_t total;			/* Heap bytes (lua_gc(L, LUA_GCCOUNT)). */
   int gcstate;			/* 0 pause, 1 propagate, 2 atomic, 3-4 sweep, 5 finalize. */
+  /* The finobj list (luaJIT_gw_finobj); without its anchors all are plain. */
+  int finobj_mode;		/* luaJIT_gw_finobj() mode. */
+  size_t ud_finobj, ud_plain;	/* Live userdata in each list. */
+  size_t ud_pending;		/* Plain ones with __gc, the sweep moves them. */
+  size_t fin_mts;		/* Metatables without __gc watched. */
 } luaJIT_gw_heap;
 
 /* Every live userdata: p = its payload (as lua_topointer()), bytes = its
@@ -192,5 +210,45 @@ LUA_API void luaJIT_gw_udata_hook(luaJIT_gw_udata_cb cb);
 ** builtin -> its C entry, a Lua function -> NULL. Pushes nothing.
 */
 LUA_API lua_CFunction luaJIT_gw_cfunc(lua_State *L, const lua_Debug *ar);
+
+/* luaJIT_gw_finobj(): a separate list of userdata with __gc, as finobj in
+** Lua 5.2+. Upstream, the atomic phase of the GC walks ALL userdata (live
+** and dead) to find the dead ones with __gc. mode 1: userdata that get a
+** metatable with __gc (lua_setmetatable, io files, ffi.load) move to a list
+** of their own and the atomic phase walks only it. Details: lj_gc.h.
+** - Can be switched at any time from the thread that runs Lua (not from a
+**   GC callback): 0 -> 1 walks all userdata once more at the next atomic
+**   phase (they move), 1 -> 0 = as upstream from the next atomic phase.
+** - Lua 5.1 semantics kept: __gc added to a metatable after setmetatable()
+**   is seen (the metatables without __gc of plain userdata are watched, a
+**   change walks all userdata once). A userdata that gets __gc while not the
+**   newest one, and dies before the next sweep, is finalized a cycle later.
+**   A userdata without __gc reachable only from the dead ones with __gc is
+**   not flagged finalized, so it stays in weak values until it dies itself.
+** mode < 0: query. Returns the mode now, -1 = out of memory (stays off).
+** The first switch on adds two hidden userdata to the state (not counted by
+** luaJIT_gw_census). The engine checks LUAJIT_GW_FINOBJ.
+*/
+#define LUAJIT_GW_FINOBJ	1
+
+LUA_API int luaJIT_gw_finobj(lua_State *L, int mode);
+
+/* Counters since the first switch on (anchors = 0: never switched on). */
+typedef struct luaJIT_gw_finobj_info {
+  int anchors, mode, dirty;	/* dirty: the next atomic walks all udata. */
+  unsigned int watched_now;	/* Metatables without __gc watched now. */
+  unsigned int pending_now;	/* Udata flagged PENDING since the last atomic. */
+  unsigned long long moved_head;  /* Moved at lua_setmetatable (newest one). */
+  unsigned long long pending;	/* Flagged PENDING (not the newest one). */
+  unsigned long long moved_sweep;  /* PENDING ones moved by the sweep. */
+  unsigned long long moved_full;  /* Moved by a walk of all udata. */
+  unsigned long long full_walks;  /* Atomic phases that walked all udata. */
+  unsigned long long full_mt;	/* Of them: a watched metatable got __gc. */
+  unsigned long long watched;	/* Metatables put on watch. */
+  unsigned long long kept;	/* PENDING ones dead at atomic, kept a cycle. */
+  unsigned long long oom;	/* Out of memory: all walked instead. */
+} luaJIT_gw_finobj_info;
+
+LUA_API void luaJIT_gw_finobj_stats(lua_State *L, luaJIT_gw_finobj_info *out);
 
 #endif
