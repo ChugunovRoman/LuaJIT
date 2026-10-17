@@ -9,6 +9,25 @@
 #include "lj_obj.h"
 #include "lj_gc.h"
 #include "lj_udata.h"
+#include "lj_frame.h"
+#include "luajit.h"
+
+/* GlobalWar diagnostics (a local patch, see luajit.h): NULL = off. */
+static luaJIT_gw_udata_cb udata_gw_hook;
+
+LUA_API void luaJIT_gw_udata_hook(luaJIT_gw_udata_cb cb)
+{
+  udata_gw_hook = cb;
+}
+
+LUA_API lua_CFunction luaJIT_gw_cfunc(lua_State *L, const lua_Debug *ar)
+{
+  uint32_t offset = (uint32_t)ar->i_ci & 0xffff;  /* As lj_debug_getinfo(). */
+  GCfunc *fn;
+  if (offset == 0) return NULL;
+  fn = frame_func(tvref(L->stack) + offset);
+  return isluafunc(fn) ? NULL : fn->c.f;
+}
 
 GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
 {
@@ -24,6 +43,8 @@ GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
   /* Chain to userdata list (after main thread). */
   setgcrefr(ud->nextgc, mainthread(g)->nextgc);
   setgcref(mainthread(g)->nextgc, obj2gco(ud));
+  if (LJ_UNLIKELY(udata_gw_hook != NULL))
+    udata_gw_hook(L, uddata(ud), (size_t)sz);  /* GlobalWar, off by default. */
   return ud;
 }
 

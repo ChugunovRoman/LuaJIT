@@ -76,4 +76,121 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 /* Enforce (dynamic) linker error for version mismatches. Call from main. */
 LUA_API void LUAJIT_VERSION_SYM(void);
 
+/* -- GlobalWar: GC diagnostics (a local patch, not in upstream LuaJIT) ---- */
+
+/* luaJIT_gw_gcstats() times every atomic phase of the GC (lj_gc.c atomic())
+** part by part and counts what each part walked. Off by default: until it is
+** given a struct, atomic() pays one load and a branch per GC cycle.
+** luaJIT_gw_census() walks all GC objects once (a diagnostic on request),
+** luaJIT_gw_objsize() returns the size of one object on the stack.
+** Only from the thread that runs Lua now. The engine checks LUAJIT_GW_GCSTATS:
+** without this patch the diagnostics are compiled out.
+*/
+#define LUAJIT_GW_GCSTATS	1
+
+/* A monotonic clock of the caller (QueryPerformanceCounter etc.). */
+typedef unsigned long long (*luaJIT_gw_clock)(void);
+
+/* One part of the atomic phase. */
+typedef struct luaJIT_gw_gcpart {
+  unsigned long long t;		/* Time, in ticks of the clock. */
+  size_t objs;			/* Objects propagated (turned black). */
+  size_t bytes;			/* Their size, as the GC estimates it. */
+  size_t tabs, tabslots;	/* Tables among them, array + hash slots. */
+  size_t threads, stackslots;	/* Threads among them, stack slots. */
+} luaJIT_gw_gcpart;
+
+/* The last atomic phase. */
+typedef struct luaJIT_gw_atomic {
+  unsigned int seq;		/* Atomic phases recorded so far. */
+  unsigned long long t_total;	/* The whole atomic(). */
+  luaJIT_gw_gcpart uv;		/* Remark of open upvalues (objs = upvalues). */
+  luaJIT_gw_gcpart left;	/* Left-overs of the gray list. */
+  luaJIT_gw_gcpart remark;	/* Weak tables again, running thread, roots. */
+  size_t remark_weak;		/* Weak tables traversed again there. */
+  luaJIT_gw_gcpart grayagain;	/* The 2nd chance list and all it reaches. */
+  size_t ga_tabs, ga_tabslots;	/* The list: tables written behind a barrier. */
+  size_t ga_threads, ga_stackslots;  /* The list: threads (always there). */
+  luaJIT_gw_gcpart separate;	/* lj_gc_separateudata(): objs = udata walked. */
+  size_t ud_white;		/* Udata found white (unreachable). */
+  size_t ud_gc;			/* Of them moved to finalization (__gc). */
+  luaJIT_gw_gcpart mmudata;	/* Mark the udata to finalize, propagate. */
+  size_t mm_count;		/* Udata/cdata waiting for finalization. */
+  luaJIT_gw_gcpart clearweak;	/* objs = weak tables, tabslots = their slots. */
+  size_t weak_cleared;		/* Slots cleared. */
+  unsigned long long t_rest;	/* lj_buf_shrink() and the sweep setup. */
+  size_t strnum, strslots;	/* Interned strings, string hash slots. */
+  size_t mainstack, curstack;	/* Stack slots of the main/running thread. */
+  size_t total, estimate;	/* Heap bytes before, estimate after. */
+} luaJIT_gw_atomic;
+
+/* st != NULL: record every atomic phase of the state of L into *st (time by
+** clock). st == NULL: off. One state at a time.
+*/
+LUA_API void luaJIT_gw_gcstats(lua_State *L, luaJIT_gw_atomic *st,
+			       luaJIT_gw_clock clock);
+
+/* Object kinds of the census (ORDER LJ_T: LJ_TSTR .. LJ_TUDATA). */
+enum {
+  LUAJIT_GW_STR, LUAJIT_GW_UPVAL, LUAJIT_GW_THREAD, LUAJIT_GW_PROTO,
+  LUAJIT_GW_FUNC, LUAJIT_GW_TRACE, LUAJIT_GW_CDATA, LUAJIT_GW_TAB,
+  LUAJIT_GW_UDATA, LUAJIT_GW__MAX
+};
+
+typedef struct luaJIT_gw_heap {
+  size_t count[LUAJIT_GW__MAX];	/* Live objects by kind (cdata: header only). */
+  size_t bytes[LUAJIT_GW__MAX];
+  size_t dead, dead_bytes;	/* Skipped: found dead, not swept yet. */
+  size_t finalize, finalize_bytes;  /* Waiting for __gc. */
+  size_t total;			/* Heap bytes (lua_gc(L, LUA_GCCOUNT)). */
+  int gcstate;			/* 0 pause, 1 propagate, 2 atomic, 3-4 sweep, 5 finalize. */
+} luaJIT_gw_heap;
+
+/* Every live userdata: p = its payload (as lua_topointer()), bytes = its
+** size in bytes (header included), metatable/environment table (as
+** lua_topointer(), NULL = none), finalized = its __gc has run (or it had
+** none when it was found unreachable).
+*/
+typedef void (*luaJIT_gw_census_ud)(void *ctx, const void *p, size_t bytes,
+				    const void *mt, const void *env,
+				    int finalized);
+/* Every live table (as lua_topointer()), its size, array and hash slots. */
+typedef void (*luaJIT_gw_census_tab)(void *ctx, const void *t, size_t bytes,
+				     unsigned int asize, unsigned int hslots,
+				     const void *mt);
+
+/* Walk all GC objects of the state: totals into *out, the callbacks (may be
+** NULL) for userdata and tables. The callbacks must not touch the Lua state.
+*/
+LUA_API void luaJIT_gw_census(lua_State *L, luaJIT_gw_heap *out,
+			      luaJIT_gw_census_ud ud, luaJIT_gw_census_tab tab,
+			      void *ctx);
+
+/* Size of the GC object at the stack index idx (no pseudo-indices), 0 for a
+** non-GC value: tables with their array and hash, strings, userdata, threads
+** with their stack, functions (without upvalues and prototypes).
+*/
+LUA_API size_t luaJIT_gw_objsize(lua_State *L, int idx);
+
+/* luaJIT_gw_udata_hook(): a callback for every new userdata (lj_udata_new:
+** lua_newuserdata, so newproxy and io files too, and ffi.load). It is called
+** right after the userdata is allocated: it is not on the stack yet and has no
+** metatable. p = its payload (as lua_touserdata() will return it), size = the
+** payload size. The callback may read the debug info of L (lua_getstack,
+** lua_getinfo without "f" and ">", luaJIT_gw_cfunc), must not push anything,
+** allocate in the Lua heap, call Lua or raise an error. One callback for the
+** process (all states). NULL (the default) = off: one load and a branch per
+** userdata. The engine checks LUAJIT_GW_UDATA_HOOK.
+*/
+#define LUAJIT_GW_UDATA_HOOK	1
+
+typedef void (*luaJIT_gw_udata_cb)(lua_State *L, void *p, size_t size);
+
+LUA_API void luaJIT_gw_udata_hook(luaJIT_gw_udata_cb cb);
+
+/* The function of the frame ar (filled by lua_getstack()): a C function or a
+** builtin -> its C entry, a Lua function -> NULL. Pushes nothing.
+*/
+LUA_API lua_CFunction luaJIT_gw_cfunc(lua_State *L, const lua_Debug *ar);
+
 #endif

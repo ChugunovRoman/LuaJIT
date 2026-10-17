@@ -27,6 +27,7 @@
 #include "lj_trace.h"
 #include "lj_dispatch.h"
 #include "lj_vm.h"
+#include "luajit.h"
 #ifdef __e2k__
 #include "e2kintrin.h"
 #endif
@@ -606,6 +607,317 @@ void lj_gc_freeall(global_State *g)
     gc_fullsweep(g, &g->strhash[i]);
 }
 
+/* -- GlobalWar: GC diagnostics (a local patch, see luajit.h) -------------- */
+
+/* NULL: off (the default), atomic() runs as in upstream. */
+static luaJIT_gw_atomic *gc_gw_stats;
+static luaJIT_gw_clock gc_gw_clock;
+static global_State *gc_gw_g;  /* The state the stats are recorded for. */
+
+/* Slots of a table: array + hash. */
+#define gc_gw_tabslots(t) \
+  ((size_t)(t)->asize + ((t)->hmask ? (size_t)(t)->hmask + 1 : 0))
+
+/* gc_propagate_gray() that counts what it propagates. */
+static size_t gc_gw_propagate(global_State *g, luaJIT_gw_gcpart *p)
+{
+  size_t m = 0;
+  while (gcref(g->gc.gray) != NULL) {
+    GCobj *o = gcref(g->gc.gray);
+    if (o->gch.gct == ~LJ_TTAB) {
+      p->tabs++;
+      p->tabslots += gc_gw_tabslots(gco2tab(o));
+    } else if (o->gch.gct == ~LJ_TTHREAD) {
+      p->threads++;
+      p->stackslots += gco2th(o)->stacksize;
+    }
+    m += propagatemark(g);
+    p->objs++;
+  }
+  p->bytes += m;
+  return m;
+}
+
+/* lj_gc_separateudata(g, 0) that counts the userdata it walks. */
+static size_t gc_gw_separateudata(global_State *g, luaJIT_gw_atomic *s)
+{
+  size_t m = 0;
+  GCRef *p = &mainthread(g)->nextgc;
+  GCobj *o;
+  while ((o = gcref(*p)) != NULL) {
+    s->separate.objs++;
+    if (iswhite(o)) s->ud_white++;
+    if (!iswhite(o) || isfinalized(gco2ud(o))) {
+      p = &o->gch.nextgc;  /* Nothing to do. */
+    } else if (!lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc)) {
+      markfinalized(o);  /* Done, as there's no __gc metamethod. */
+      p = &o->gch.nextgc;
+    } else {  /* Otherwise move userdata to be finalized to mmudata list. */
+      m += sizeudata(gco2ud(o));
+      s->ud_gc++;
+      markfinalized(o);
+      *p = o->gch.nextgc;
+      if (gcref(g->gc.mmudata)) {  /* Link to end of mmudata list. */
+	GCobj *root = gcref(g->gc.mmudata);
+	setgcrefr(o->gch.nextgc, root->gch.nextgc);
+	setgcref(root->gch.nextgc, o);
+	setgcref(g->gc.mmudata, o);
+      } else {  /* Create circular list. */
+	setgcref(o->gch.nextgc, o);
+	setgcref(g->gc.mmudata, o);
+      }
+    }
+  }
+  s->separate.bytes = m;
+  return m;
+}
+
+/* gc_clearweak() that counts the tables, their slots and the cleared ones. */
+static void gc_gw_clearweak(global_State *g, GCobj *o, luaJIT_gw_atomic *s)
+{
+  UNUSED(g);
+  while (o) {
+    GCtab *t = gco2tab(o);
+    lj_assertG((t->marked & LJ_GC_WEAK), "clear of non-weak table");
+    s->clearweak.objs++;
+    s->clearweak.tabs++;
+    s->clearweak.tabslots += gc_gw_tabslots(t);
+    if ((t->marked & LJ_GC_WEAKVAL)) {
+      MSize i, asize = t->asize;
+      for (i = 0; i < asize; i++) {
+	TValue *tv = arrayslot(t, i);
+	if (gc_mayclear(tv, 1)) {
+	  setnilV(tv);
+	  s->weak_cleared++;
+	}
+      }
+    }
+    if (t->hmask > 0) {
+      Node *node = noderef(t->node);
+      MSize i, hmask = t->hmask;
+      for (i = 0; i <= hmask; i++) {
+	Node *n = &node[i];
+	if (!tvisnil(&n->val) && (gc_mayclear(&n->key, 0) ||
+				  gc_mayclear(&n->val, 1))) {
+	  setnilV(&n->val);
+	  s->weak_cleared++;
+	}
+      }
+    }
+    o = gcref(t->gclist);
+  }
+}
+
+/* atomic() with the time and the counts of each part. Keep in sync with it. */
+static void atomic_gw(global_State *g, lua_State *L, luaJIT_gw_atomic *st)
+{
+  luaJIT_gw_clock clk = gc_gw_clock;
+  luaJIT_gw_atomic s;
+  unsigned long long t0, t1, t2;
+  size_t udsize;
+  GCupval *uv;
+  GCobj *o;
+
+  memset(&s, 0, sizeof(s));
+  s.total = (size_t)g->gc.total;
+  s.strnum = g->strnum;
+  s.strslots = (size_t)g->strmask + 1;
+  s.mainstack = mainthread(g)->stacksize;
+  s.curstack = L->stacksize;
+  for (uv = uvnext(&g->uvhead); uv != &g->uvhead; uv = uvnext(uv))
+    s.uv.objs++;
+
+  t0 = clk();
+  gc_mark_uv(g);  /* Need to remark open upvalues (the thread may be dead). */
+  t1 = clk(); s.uv.t = t1 - t0;
+  gc_gw_propagate(g, &s.left);  /* Propagate any left-overs. */
+  t2 = clk(); s.left.t = t2 - t1;
+
+  for (o = gcref(g->gc.weak); o; o = gcref(gco2tab(o)->gclist))
+    s.remark_weak++;
+  t1 = clk();
+  setgcrefr(g->gc.gray, g->gc.weak);  /* Empty the list of weak tables. */
+  setgcrefnull(g->gc.weak);
+  lj_assertG(!iswhite(obj2gco(mainthread(g))), "main thread turned white");
+  gc_markobj(g, L);  /* Mark running thread. */
+  gc_traverse_curtrace(g);  /* Traverse current trace. */
+  gc_mark_gcroot(g);  /* Mark GC roots (again). */
+  gc_gw_propagate(g, &s.remark);  /* Propagate all of the above. */
+  t2 = clk(); s.remark.t = t2 - t1;
+
+  for (o = gcref(g->gc.grayagain); o; o = gcref(o->gch.gclist)) {
+    if (o->gch.gct == ~LJ_TTAB) {
+      s.ga_tabs++;
+      s.ga_tabslots += gc_gw_tabslots(gco2tab(o));
+    } else if (o->gch.gct == ~LJ_TTHREAD) {
+      s.ga_threads++;
+      s.ga_stackslots += gco2th(o)->stacksize;
+    }
+  }
+  t1 = clk();
+  setgcrefr(g->gc.gray, g->gc.grayagain);  /* Empty the 2nd chance list. */
+  setgcrefnull(g->gc.grayagain);
+  gc_gw_propagate(g, &s.grayagain);  /* Propagate it. */
+  t2 = clk(); s.grayagain.t = t2 - t1;
+
+  /* Separate userdata to be finalized. */
+  udsize = gc_gw_separateudata(g, &s);
+  t1 = clk(); s.separate.t = t1 - t2;
+  gc_mark_mmudata(g);  /* Mark them. */
+  udsize += gc_gw_propagate(g, &s.mmudata);  /* And propagate the marks. */
+  t2 = clk(); s.mmudata.t = t2 - t1;
+
+  /* All marking done, clear weak tables. */
+  gc_gw_clearweak(g, gcref(g->gc.weak), &s);
+  t1 = clk(); s.clearweak.t = t1 - t2;
+
+  lj_buf_shrink(L, &g->tmpbuf);  /* Shrink temp buffer. */
+
+  /* Prepare for sweep phase. */
+  g->gc.currentwhite = (uint8_t)otherwhite(g);  /* Flip current white. */
+  g->strempty.marked = g->gc.currentwhite;
+  setmref(g->gc.sweep, &g->gc.root);
+  g->gc.estimate = g->gc.total - (GCSize)udsize;  /* Initial estimate. */
+  t2 = clk(); s.t_rest = t2 - t1;
+  s.t_total = t2 - t0;
+
+  if (gcref(g->gc.mmudata)) {  /* Count the circular mmudata list. */
+    GCobj *root = gcref(g->gc.mmudata);
+    o = root;
+    do {
+      o = gcnext(o);
+      s.mm_count++;
+    } while (o != root);
+  }
+  s.estimate = (size_t)g->gc.estimate;
+  s.seq = st->seq + 1;
+  *st = s;
+}
+
+LUA_API void luaJIT_gw_gcstats(lua_State *L, luaJIT_gw_atomic *st,
+			       luaJIT_gw_clock clock)
+{
+  if (st && clock) {
+    gc_gw_clock = clock;
+    gc_gw_g = G(L);
+    gc_gw_stats = st;
+  } else {
+    gc_gw_stats = NULL;
+    gc_gw_g = NULL;
+  }
+}
+
+/* Size of a GC object, as the GC counts it (cdata: the header only). */
+static size_t gc_gw_objsize(GCobj *o)
+{
+  switch (o->gch.gct) {
+  case ~LJ_TSTR: return sizestring(gco2str(o));
+  case ~LJ_TUPVAL: return sizeof(GCupval);
+  case ~LJ_TTHREAD:
+    return sizeof(lua_State) + sizeof(TValue) * gco2th(o)->stacksize;
+  case ~LJ_TPROTO: return gco2pt(o)->sizept;
+  case ~LJ_TFUNC: {
+    GCfunc *fn = gco2func(o);
+    return isluafunc(fn) ? sizeLfunc((MSize)fn->l.nupvalues) :
+			   sizeCfunc((MSize)fn->c.nupvalues);
+    }
+#if LJ_HASJIT
+  case ~LJ_TTRACE: {
+    GCtrace *T = gco2trace(o);
+    return ((sizeof(GCtrace)+7)&~7) + (T->nins-T->nk)*sizeof(IRIns) +
+	   T->nsnap*sizeof(SnapShot) + T->nsnapmap*sizeof(SnapEntry);
+    }
+#endif
+#if LJ_HASFFI
+  case ~LJ_TCDATA: return sizeof(GCcdata);
+#endif
+  case ~LJ_TTAB: {
+    GCtab *t = gco2tab(o);
+    return sizeof(GCtab) + sizeof(TValue) * t->asize +
+	   (t->hmask ? sizeof(Node) * (t->hmask + 1) : 0);
+    }
+  case ~LJ_TUDATA: return sizeudata(gco2ud(o));
+  default: return 0;
+  }
+}
+
+/* One object of the census. */
+static void gc_gw_census_obj(global_State *g, GCobj *o, luaJIT_gw_heap *out,
+			     luaJIT_gw_census_ud cbu, luaJIT_gw_census_tab cbt,
+			     void *ctx)
+{
+  size_t sz = gc_gw_objsize(o);
+  uint32_t k = (uint32_t)o->gch.gct - ~LJ_TSTR;
+  if (isdead(g, o) && !(o->gch.marked & LJ_GC_FIXED)) {
+    out->dead++;
+    out->dead_bytes += sz;
+    return;
+  }
+  if (k < LUAJIT_GW__MAX) {
+    out->count[k]++;
+    out->bytes[k] += sz;
+  }
+  if (o->gch.gct == ~LJ_TTAB) {
+    GCtab *t = gco2tab(o);
+    if (cbt)
+      cbt(ctx, (const void *)t, sz, t->asize,
+	  t->hmask ? t->hmask + 1 : 0, (const void *)tabref(t->metatable));
+  } else if (o->gch.gct == ~LJ_TUDATA) {
+    GCudata *ud = gco2ud(o);
+    if (cbu)
+      cbu(ctx, uddata(ud), sz, (const void *)tabref(ud->metatable),
+	  (const void *)tabref(ud->env), isfinalized(ud) ? 1 : 0);
+  } else if (o->gch.gct == ~LJ_TTHREAD) {  /* Its open upvalues. */
+    GCobj *u;
+    for (u = gcref(gco2th(o)->openupval); u; u = gcref(u->gch.nextgc)) {
+      out->count[LUAJIT_GW_UPVAL]++;
+      out->bytes[LUAJIT_GW_UPVAL] += sizeof(GCupval);
+    }
+  }
+}
+
+LUA_API void luaJIT_gw_census(lua_State *L, luaJIT_gw_heap *out,
+			      luaJIT_gw_census_ud ud, luaJIT_gw_census_tab tab,
+			      void *ctx)
+{
+  global_State *g = G(L);
+  GCobj *o;
+  MSize i;
+  memset(out, 0, sizeof(*out));
+  out->total = (size_t)g->gc.total;
+  out->gcstate = g->gc.state;
+  /* All objects but strings and open upvalues; userdata after the main thread. */
+  for (o = gcref(g->gc.root); o; o = gcref(o->gch.nextgc))
+    gc_gw_census_obj(g, o, out, ud, tab, ctx);
+  for (i = 0; i <= g->strmask; i++)  /* Strings: the hash chains. */
+    for (o = gcref(g->strhash[i]); o; o = gcref(o->gch.nextgc))
+      gc_gw_census_obj(g, o, out, ud, tab, ctx);
+  if (gcref(g->gc.mmudata)) {  /* Waiting for __gc: unlinked from the root. */
+    GCobj *root = gcref(g->gc.mmudata);
+    o = root;
+    do {
+      o = gcnext(o);
+      out->finalize++;
+      out->finalize_bytes += gc_gw_objsize(o);
+    } while (o != root);
+  }
+}
+
+LUA_API size_t luaJIT_gw_objsize(lua_State *L, int idx)
+{
+  cTValue *o;
+  if (idx > 0) {
+    o = L->base + (idx - 1);
+    if (o >= L->top) return 0;
+  } else if (idx < 0 && idx > LUA_REGISTRYINDEX) {
+    o = L->top + idx;
+    if (o < L->base) return 0;
+  } else {
+    return 0;
+  }
+  return tvisgcv(o) ? gc_gw_objsize(gcV(o)) : 0;
+}
+
 /* -- Collector ----------------------------------------------------------- */
 
 /* Atomic part of the GC cycle, transitioning from mark to sweep phase. */
@@ -613,6 +925,10 @@ static void atomic(global_State *g, lua_State *L)
 {
   size_t udsize;
 
+  if (LJ_UNLIKELY(gc_gw_stats != NULL) && gc_gw_g == g) {
+    atomic_gw(g, L, gc_gw_stats);  /* GlobalWar diagnostics, off by default. */
+    return;
+  }
   gc_mark_uv(g);  /* Need to remark open upvalues (the thread may be dead). */
   gc_propagate_gray(g);  /* Propagate any left-overs. */
 
