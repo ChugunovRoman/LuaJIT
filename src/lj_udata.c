@@ -46,7 +46,7 @@ GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
     ** of luaJIT_gw_finobj() to the head of the plain list (lj_gc.h).
     */
     GCudata *a = gc_gw_anchor(g);
-    GCRef *head = a ? &gwfin(a)->b->nextgc : &mainthread(g)->nextgc;
+    GCRef *head = a ? gc_gw_plainhead(gwfin(a)) : &mainthread(g)->nextgc;
     setgcrefr(ud->nextgc, *head);
     setgcref(*head, obj2gco(ud));
     /* The creation stamp: the finalization order of the finobj lists. */

@@ -58,6 +58,7 @@
     if (tviswhite_volatile(tv)) gc_mark(g, gcV(tv)); }
 #endif
 
+
 /* Mark a GCobj (if needed). */
 #define gc_markobj(g, o) \
   { if (iswhite(obj2gco(o))) gc_mark(g, obj2gco(o)); }
@@ -100,9 +101,12 @@ static void gc_mark_gcroot(global_State *g)
       gc_markobj(g, gcref(g->gcroot[i]));
 }
 
+static void gc_gw_cyclestart(global_State *g);
+
 /* Start a GC cycle and mark the root set. */
 static void gc_mark_start(global_State *g)
 {
+  gc_gw_cyclestart(g);  /* GlobalWar: the prewalk anew (lj_gc.h). */
   setgcrefnull(g->gc.gray);
   setgcrefnull(g->gc.grayagain);
   setgcrefnull(g->gc.weak);
@@ -124,6 +128,7 @@ static void gc_mark_uv(global_State *g)
       gc_marktv(g, uvval(uv));
   }
 }
+
 
 /* Mark userdata in mmudata list. */
 static void gc_mark_mmudata(global_State *g)
@@ -164,7 +169,12 @@ static LJ_AINLINE GCRef *gc_separate_one(global_State *g, GCRef *p, GCobj *o,
 {
   w->objs++;
   if (iswhite(o)) w->white++;
-  if (!(iswhite(o) || all) || isfinalized(gco2ud(o))) {
+  /* GlobalWar: a dead one not swept yet (lua_close() in the sweep phase) is
+  ** garbage of the last atomic phase. Upstream flagged it finalized there
+  ** (it had no __gc then), finobj mode 1 does not walk the plain list: its
+  ** metatable may have got __gc since, while what it refers to is freed.
+  */
+  if (!(iswhite(o) || all) || isfinalized(gco2ud(o)) || isdead(g, o)) {
     return &o->gch.nextgc;  /* Nothing to do. */
   } else if (!lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc)) {
     markfinalized(o);  /* Done, as there's no __gc metamethod. */
@@ -255,7 +265,172 @@ static GCRef *gc_gw_finobj_insert(GCgwfin *f, GCRef *ins, GCobj *o)
   setgcrefr(o->gch.nextgc, *ins);
   setgcref(*ins, o);
   gwudflags(gco2ud(o)) = LJ_GW_UD_FINOBJ;
+  /* The prewalk is right at it (lua_setmetatable() in the propagate phase):
+  ** o newer than the last udata walked is behind the prewalk, so it must not
+  ** be walked (the checked list would lose its order). The atomic phase walks
+  ** it with the finobj list. An older o is the next one to walk.
+  */
+  if (LJ_UNLIKELY(ins == f->pwu) && f->pwstate == LJ_GW_PWS_WALK &&
+      f->pwwalked && (int32_t)(gwudstamp(gco2ud(o)) - f->pwfront) > 0)
+    f->pwu = &o->gch.nextgc;
   return &o->gch.nextgc;
+}
+
+/* Whether the atomic phase has nothing to do with a finobj udata: marked
+** (userdata are never gray) or finalized (it had no __gc when walked).
+*/
+#define gc_gw_checked(o) \
+  (!iswhite(o) || isfinalized(gco2ud(o)))
+
+#if defined(LUAJIT_GW_PREWALK_CHECK) && defined(LUA_USE_ASSERT)
+/* Test builds only (O(udata) per call): both parts of the finobj list sorted,
+** the prewalk frontier, the checked part before pk holds only checked udata,
+** the plain list sorted (finalized and dead udata aside).
+*/
+static void gc_gw_verify(global_State *g, GCudata *a)
+{
+  GCgwfin *f = gwfin(a);
+  GCobj *b = obj2gco(f->b), *c = obj2gco(f->c), *o, *prev = NULL;
+  int walk = f->pwstate == LJ_GW_PWS_WALK && f->pwwalked;
+  int before = 1;
+  GCRef *p;
+  for (p = &a->nextgc; (o = gcref(*p)) != b; p = &o->gch.nextgc) {
+    if (p == f->pwu) before = 0;
+    lj_assertG(o->gch.gct == ~LJ_TUDATA, "finobj: not a udata");
+    lj_assertG(gwudflags(gco2ud(o)) == LJ_GW_UD_FINOBJ, "finobj: flags");
+    lj_assertG(!prev || gc_gw_newer(prev, o), "finobj: order");
+    if (walk)
+      lj_assertG(before ? (int32_t)(gwudstamp(gco2ud(o)) - f->pwfront) >= 0 :
+		 (int32_t)(gwudstamp(gco2ud(o)) - f->pwfront) < 0,
+		 "finobj: prewalk frontier");
+    prev = o;
+  }
+  lj_assertG(!walk || before == 0 || f->pwu == p, "finobj: pwu lost");
+  prev = NULL;
+  before = f->pwstate != LJ_GW_PWS_IDLE;
+  for (p = &f->b->nextgc; (o = gcref(*p)) != c; p = &o->gch.nextgc) {
+    if (p == f->pwk) before = 0;
+    lj_assertG(o->gch.gct == ~LJ_TUDATA, "checked: not a udata");
+    lj_assertG(gwudflags(gco2ud(o)) == LJ_GW_UD_FINOBJ, "checked: flags");
+    lj_assertG(!prev || gc_gw_newer(prev, o), "checked: order");
+    if (before && g->gc.state <= GCSatomic)
+      lj_assertG(gc_gw_checked(o), "checked: white udata before pk");
+    if (walk)
+      lj_assertG(before ? (int32_t)(gwudstamp(gco2ud(o)) - f->pwfront) >= 0 :
+		 (int32_t)(gwudstamp(gco2ud(o)) - f->pwfront) < 0,
+		 "checked: prewalk frontier");
+    prev = o;
+  }
+  lj_assertG(f->pwstate == LJ_GW_PWS_IDLE || before == 0 || f->pwk == p,
+	     "checked: pwk lost");
+  prev = NULL;
+  for (p = &f->c->nextgc; (o = gcref(*p)) != NULL; p = &o->gch.nextgc) {
+    if (isfinalized(gco2ud(o)) || isdead(g, o)) continue;
+    lj_assertG(!prev || gc_gw_newer(prev, o), "plain: order");
+    prev = o;
+  }
+}
+#define gc_gw_check(g, a)	gc_gw_verify((g), (a))
+#else
+#define gc_gw_check(g, a)	((void)0)
+#endif
+
+/* Merge the checked list back into the finobj list (both sorted newest
+** first): the walks of all userdata (mode 0, the full walk, lua_close) see
+** one sorted finobj list. Ends the prewalk of the cycle.
+*/
+static void gc_gw_unsplit(global_State *g, GCudata *a)
+{
+  GCgwfin *f = gwfin(a);
+  GCobj *b = obj2gco(f->b), *c = obj2gco(f->c), *k, *n;
+  GCRef *pu = &a->nextgc;
+  f->pwstate = LJ_GW_PWS_IDLE;
+  if (gcref(f->b->nextgc) == c) return;  /* Empty. */
+  f->pw_merges++;
+  while ((k = gcref(f->b->nextgc)) != c) {
+    while ((n = gcref(*pu)) != b && gc_gw_newer(n, k))
+      pu = &n->gch.nextgc;
+    setgcrefr(f->b->nextgc, k->gch.nextgc);  /* Unlink the checked head. */
+    setgcrefr(k->gch.nextgc, *pu);
+    setgcref(*pu, k);
+    pu = &k->gch.nextgc;
+  }
+  gc_gw_check(g, a);
+  UNUSED(g);
+}
+
+/* Start of a GC cycle: the prewalk and the grayagain drains anew. */
+static void gc_gw_cyclestart(global_State *g)
+{
+  GCudata *a = gc_gw_anchor(g);
+  GCgwfin *f;
+  if (a == NULL) return;
+  f = gwfin(a);
+  f->gadrains = 0;
+  f->gadrained = 0;
+  f->pwwalked = f->pwchecked = 0;
+  f->pwu = &a->nextgc;
+  f->pwk = &f->b->nextgc;
+  f->pwfront = 0;
+  /* Dirty: the atomic phase walks all userdata anyway. */
+  f->pwstate = (f->mode && (f->pwflags & LJ_GW_PW_UDATA) && !f->dirty) ?
+	       LJ_GW_PWS_WALK : LJ_GW_PWS_IDLE;
+}
+
+#define GCPREWALKMAX	40	/* Udata per step of the prewalk. */
+
+/* One step of the prewalk: the next udata of both lists merged by stamp. A
+** marked or finalized one goes to (or stays in) the checked list, any other
+** one to (or in) the finobj list, each behind the udata walked before it.
+** Returns the cost of the step.
+*/
+static size_t gc_gw_prewalk(global_State *g, GCudata *a)
+{
+  GCgwfin *f = gwfin(a);
+  GCobj *b = obj2gco(f->b), *c = obj2gco(f->c);
+  GCRef *pu = f->pwu, *pk = f->pwk;
+  size_t n = 0;
+  while (n < GCPREWALKMAX) {
+    GCobj *ou = gcref(*pu), *ok = gcref(*pk), *o;
+    if (ou == b) ou = NULL;
+    if (ok == c) ok = NULL;
+    if (ou == NULL && ok == NULL) {
+      f->pwstate = LJ_GW_PWS_DONE;
+      f->pw_cycles++;
+      break;
+    }
+    if (ok == NULL || (ou != NULL && gc_gw_newer(ou, ok))) {
+      o = ou;
+      if (gc_gw_checked(o)) {  /* To the checked list. */
+	setgcrefr(*pu, o->gch.nextgc);
+	setgcrefr(o->gch.nextgc, *pk);
+	setgcref(*pk, o);
+	pk = &o->gch.nextgc;
+	f->pwchecked++;
+      } else {
+	pu = &o->gch.nextgc;
+      }
+    } else {
+      o = ok;
+      if (gc_gw_checked(o)) {
+	pk = &o->gch.nextgc;
+	f->pwchecked++;
+      } else {  /* Back to the finobj list. */
+	setgcrefr(*pk, o->gch.nextgc);
+	setgcrefr(o->gch.nextgc, *pu);
+	setgcref(*pu, o);
+	pu = &o->gch.nextgc;
+      }
+    }
+    f->pwfront = gwudstamp(gco2ud(o));
+    f->pwwalked++;
+    n++;
+  }
+  f->pwu = pu;
+  f->pwk = pk;
+  gc_gw_check(g, a);
+  UNUSED(g);
+  return (n ? n : 1) * GCSWEEPCOST;
 }
 
 /* A userdata got a metatable (lua_setmetatable() and the libraries). */
@@ -273,7 +448,7 @@ void lj_gc_gw_udmeta(lua_State *L, GCudata *ud)
     return;  /* The hook sees the metatable it may get later. */
   if (lj_meta_fastg(g, mt, MM_gc)) {
     GCobj *o = obj2gco(ud);
-    GCRef *p = &f->b->nextgc;
+    GCRef *p = gc_gw_plainhead(f);
     if (gcref(*p) == o) {  /* The head of the plain list: move it now. */
       /* The sweep may be right at it: let it go on with the next one. */
       if (mref(g->gc.sweep, GCRef) == &o->gch.nextgc)
@@ -287,6 +462,7 @@ void lj_gc_gw_udmeta(lua_State *L, GCudata *ud)
       if (g->gc.state == GCSsweepstring || g->gc.state == GCSsweep)
 	makewhite(g, o);
       f->moved_head++;
+      gc_gw_check(g, a);
     } else if (gc_gw_addpend(g, f, ud)) {
       /* The next sweep moves it (gc_sweep). */
     } else {
@@ -312,6 +488,8 @@ void lj_gc_gw_freeanchor(global_State *g, GCudata *ud)
 /* GlobalWar: what gc_separate_atomic() did. */
 typedef struct GCgwsep {
   GCgwwalk fin, plain;	/* The finobj list; the plain list. */
+  GCgwwalk tail;	/* The checked list the prewalk did not reach. */
+  int pwstate;		/* LJ_GW_PWS_* of the prewalk before this phase. */
   int mode, full;	/* full: 1 forced, 2 a watched metatable got __gc. */
   size_t moved;		/* Full walk: live udata moved to the finobj list. */
   size_t pending, kept;	/* PENDING udata; of them white, kept a cycle. */
@@ -329,8 +507,9 @@ static size_t gc_gw_walkboth(global_State *g, GCudata *a, int all, int full,
 {
   GCgwfin *f = gwfin(a);
   GCobj *b = obj2gco(f->b);
-  GCRef *pf = &a->nextgc, *pp = &f->b->nextgc;
+  GCRef *pf = &a->nextgc, *pp = gc_gw_plainhead(f);
   size_t m = 0;
+  gc_gw_unsplit(g, a);  /* One sorted finobj list: B is right before C now. */
   for (;;) {
     GCobj *of = gcref(*pf), *op = gcref(*pp);
     GCudata *ud;
@@ -389,17 +568,51 @@ size_t lj_gc_separateudata(global_State *g, int all)
   }
 }
 
+/* The atomic phase in mode 1: the finobj list and the checked list from pk
+** on (the part the prewalk did not reach, all of it without the prewalk),
+** merged by stamp. The checked list before pk holds only marked or finalized
+** udata: nothing to do there.
+*/
+static size_t gc_gw_walkfin(global_State *g, GCudata *a, GCRef *pk,
+			    GCgwsep *s)
+{
+  GCgwfin *f = gwfin(a);
+  GCobj *b = obj2gco(f->b), *c = obj2gco(f->c);
+  GCRef *pu = &a->nextgc;
+  size_t m = 0;
+  for (;;) {
+    GCobj *ou = gcref(*pu), *ok = gcref(*pk);
+    if (ou == b) ou = NULL;
+    if (ok == c) ok = NULL;
+    if (ok == NULL) {
+      if (ou == NULL) break;
+      pu = gc_separate_one(g, pu, ou, 0, &s->fin, &m);
+    } else if (ou != NULL && gc_gw_newer(ou, ok)) {
+      pu = gc_separate_one(g, pu, ou, 0, &s->fin, &m);
+    } else {
+      pk = gc_separate_one(g, pk, ok, 0, &s->tail, &m);
+    }
+  }
+  return m;
+}
+
 /* lj_gc_separateudata(g, 0) of the atomic phase. */
 static size_t gc_separate_atomic(global_State *g, GCgwsep *s)
 {
   GCudata *a = gc_gw_anchor(g);
   GCgwfin *f;
+  GCRef *pk;
   size_t m;
   MSize i;
   if (a == NULL)  /* All userdata, as upstream. */
     return gc_separate_list(g, &mainthread(g)->nextgc, NULL, 0, &s->plain);
   f = gwfin(a);
   f->sweepins = &a->nextgc;  /* The sweep after it starts anew. */
+  /* The prewalk of this cycle ends here (its cursors are not valid after). */
+  s->pwstate = f->pwstate;
+  pk = f->pwstate != LJ_GW_PWS_IDLE ? f->pwk : &f->b->nextgc;
+  gc_gw_check(g, a);
+  f->pwstate = LJ_GW_PWS_IDLE;
   if (!f->mode)  /* Off: both lists, as upstream. */
     return gc_gw_walkboth(g, a, 0, 0, s);
   s->mode = 1;
@@ -421,7 +634,7 @@ static size_t gc_separate_atomic(global_State *g, GCgwsep *s)
     m = gc_gw_walkboth(g, a, 0, 1, s);
     f->moved_full += s->moved;
   } else {
-    m = gc_separate_list(g, &a->nextgc, obj2gco(f->b), 0, &s->fin);
+    m = gc_gw_walkfin(g, a, pk, s);
     for (i = 0; i < f->npend; i++) {
       GCobj *o = obj2gco(f->pend[i]);
       /* Unreachable, but its __gc needs the finobj list: keep it for one
@@ -730,7 +943,15 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
 	if (a) {
 	  GCgwfin *f = gwfin(a);
 	  setgcrefr(*p, o->gch.nextgc);  /* Unlink. */
-	  /* The sweep meets them newest first: the place only moves on. */
+	  /* The sweep meets them newest first: the place only moves on. Not
+	  ** always: a udata made while the sweep stands at the head of the
+	  ** plain list is ahead of it, and newer than the ones moved already.
+	  ** Then search from the head of the finobj list.
+	  */
+	  if (f->sweepins != &a->nextgc &&
+	      gc_gw_newer(o, (GCobj *)((char *)f->sweepins -
+				       offsetof(GCudata, nextgc))))
+	    f->sweepins = &a->nextgc;
 	  f->sweepins = gc_gw_finobj_insert(f, f->sweepins, o);
 	  f->moved_sweep++;
 	  continue;
@@ -858,7 +1079,7 @@ static void gc_finalize(lua_State *L)
   {
     /* GlobalWar: finalized, so to the plain list of luaJIT_gw_finobj(). */
     GCudata *a = gc_gw_anchor(g);
-    GCRef *head = a ? &gwfin(a)->b->nextgc : &mainthread(g)->nextgc;
+    GCRef *head = a ? gc_gw_plainhead(gwfin(a)) : &mainthread(g)->nextgc;
     setgcrefr(o->gch.nextgc, *head);
     setgcref(*head, o);
     gwudflags(gco2ud(o)) = 0;
@@ -949,12 +1170,22 @@ static size_t gc_gw_propagate(global_State *g, luaJIT_gw_gcpart *p)
 static size_t gc_gw_separateudata(global_State *g, luaJIT_gw_atomic *s)
 {
   GCgwsep sep;
+  GCudata *a = gc_gw_anchor(g);
   size_t m;
   memset(&sep, 0, sizeof(sep));
+  if (a) {  /* What ran before the atomic phase (reset at the next cycle). */
+    GCgwfin *f = gwfin(a);
+    s->pw_walked = f->pwwalked;
+    s->pw_checked = f->pwchecked;
+    s->ga_drains = f->gadrains;
+    s->ga_drained = f->gadrained;
+  }
   m = gc_separate_atomic(g, &sep);
-  s->separate.objs = sep.fin.objs + sep.plain.objs;
-  s->ud_white = sep.fin.white + sep.plain.white;
-  s->ud_gc = sep.fin.gc + sep.plain.gc;
+  s->pw_state = sep.pwstate;
+  s->pw_tail = sep.tail.objs;
+  s->separate.objs = sep.fin.objs + sep.plain.objs + sep.tail.objs;
+  s->ud_white = sep.fin.white + sep.plain.white + sep.tail.white;
+  s->ud_gc = sep.fin.gc + sep.plain.gc + sep.tail.gc;
   s->separate.bytes = m;
   s->fin_mode = sep.mode;
   s->fin_full = sep.full;
@@ -1181,7 +1412,7 @@ LUA_API void luaJIT_gw_census(lua_State *L, luaJIT_gw_heap *out,
 {
   global_State *g = G(L);
   GCudata *a = gc_gw_anchor(g);
-  int seg = 0;  /* 1: in the finobj list, 0/2: in the plain one. */
+  int seg = 0;  /* 1: finobj list, 3: checked list, 0/2: plain list. */
   GCobj *o;
   MSize i;
   memset(out, 0, sizeof(*out));
@@ -1193,11 +1424,15 @@ LUA_API void luaJIT_gw_census(lua_State *L, luaJIT_gw_heap *out,
       seg = 1;
       continue;
     } else if (a && o == obj2gco(gwfin(a)->b)) {
+      seg = 3;
+      continue;
+    } else if (a && o == obj2gco(gwfin(a)->c)) {
       seg = 2;
       continue;
     }
     if (o->gch.gct == ~LJ_TUDATA && !isdead(g, o)) {
-      if (seg == 1) out->ud_finobj++; else out->ud_plain++;
+      if (seg == 1 || seg == 3) out->ud_finobj++; else out->ud_plain++;
+      if (seg == 3) out->ud_checked++;
       if ((gwudflags(gco2ud(o)) & LJ_GW_UD_PENDING)) out->ud_pending++;
     }
     gc_gw_census_obj(g, o, out, ud, tab, ctx);
@@ -1237,23 +1472,21 @@ LUA_API size_t luaJIT_gw_objsize(lua_State *L, int idx)
 
 /* -- GlobalWar: the finobj list switch (see lj_gc.h, luajit.h) ----------- */
 
-/* Make anchors A and B right after the main thread. NULL: out of memory. */
+/* Make anchors A, B and C right after the main thread. NULL: out of memory. */
 static GCudata *gc_gw_newanchors(global_State *g)
 {
   GCSize sa = sizeof(GCudata) + sizeof(GCgwfin), sb = sizeof(GCudata);
-  GCudata *a = (GCudata *)g->allocf(g->allocd, NULL, 0, sa);
-  GCudata *b;
-  GCudata *u[2];
+  GCudata *u[3];
   int i;
-  if (a == NULL) return NULL;
-  b = (GCudata *)g->allocf(g->allocd, NULL, 0, sb);
-  if (b == NULL) {
-    g->allocf(g->allocd, a, sa, 0);
-    return NULL;
+  for (i = 0; i < 3; i++) {
+    u[i] = (GCudata *)g->allocf(g->allocd, NULL, 0, i ? sb : sa);
+    if (u[i] == NULL) {
+      while (i-- > 0) g->allocf(g->allocd, u[i], i ? sb : sa, 0);
+      return NULL;
+    }
   }
-  g->gc.total += sa + sb;
-  u[0] = a; u[1] = b;
-  for (i = 0; i < 2; i++) {
+  g->gc.total += sa + 2 * sb;
+  for (i = 0; i < 3; i++) {
     /* Fixed: the sweep keeps them, lj_gc_freeall() frees them. Never marked
     ** (unreachable from Lua): no metatable, no environment.
     */
@@ -1262,13 +1495,17 @@ static GCudata *gc_gw_newanchors(global_State *g)
     u[i]->gct = ~LJ_TUDATA;
     u[i]->udtype = LJ_GW_UDTYPE_ANCHOR;
     gwudflags(u[i]) = 0;
+    gwudstamp(u[i]) = 0;
     u[i]->len = i ? 0 : sizeof(GCgwfin);
     setgcrefnull(u[i]->metatable);
     setgcrefnull(u[i]->env);
   }
-  memset(gwfin(a), 0, sizeof(GCgwfin));
-  gwfin(a)->b = b;
-  gwfin(a)->sweepins = &a->nextgc;
+  memset(gwfin(u[0]), 0, sizeof(GCgwfin));
+  gwfin(u[0])->b = u[1];
+  gwfin(u[0])->c = u[2];
+  gwfin(u[0])->sweepins = &u[0]->nextgc;
+  gwfin(u[0])->pwu = &u[0]->nextgc;
+  gwfin(u[0])->pwk = &u[1]->nextgc;
   {  /* Creation stamps of the userdata so far (the list is newest first):
      ** 0, -1, -2... The next new one gets 1.
      */
@@ -1277,13 +1514,14 @@ static GCudata *gc_gw_newanchors(global_State *g)
     for (o = gcref(mainthread(g)->nextgc); o; o = gcref(o->gch.nextgc))
       gwudstamp(gco2ud(o)) = st--;
   }
-  /* mainthread -> A -> B -> (the userdata so far: the plain list). The sweep
-  ** may stand at &mainthread->nextgc: then A and B are next, both alive.
+  /* mainthread -> A -> B -> C -> (the userdata so far: the plain list). The
+  ** sweep may stand at &mainthread->nextgc: then A, B and C are next, alive.
   */
-  setgcrefr(b->nextgc, mainthread(g)->nextgc);
-  setgcref(a->nextgc, obj2gco(b));
-  setgcref(mainthread(g)->nextgc, obj2gco(a));
-  return a;
+  setgcrefr(u[2]->nextgc, mainthread(g)->nextgc);
+  setgcref(u[1]->nextgc, obj2gco(u[2]));
+  setgcref(u[0]->nextgc, obj2gco(u[1]));
+  setgcref(mainthread(g)->nextgc, obj2gco(u[0]));
+  return u[0];
 }
 
 LUA_API int luaJIT_gw_finobj(lua_State *L, int mode)
@@ -1334,7 +1572,80 @@ LUA_API void luaJIT_gw_finobj_stats(lua_State *L, luaJIT_gw_finobj_info *out)
     out->watched = f->watched;
     out->kept = f->kept;
     out->oom = f->oom;
+    out->pw_flags = f->pwflags;
+    out->pw_cycles = f->pw_cycles;
+    out->pw_walked = f->pw_walked;
+    out->pw_checked = f->pw_checked;
+    out->pw_merges = f->pw_merges;
+    out->ga_drains = f->ga_drains;
   }
+}
+
+LUA_API int luaJIT_gw_prewalk(lua_State *L, int flags)
+{
+  GCudata *a = gc_gw_anchor(G(L));
+  if (flags < 0)  /* Query. */
+    return a ? gwfin(a)->pwflags : 0;
+  if (a == NULL)
+    return -1;  /* Needs the anchors of luaJIT_gw_finobj(). */
+  /* Switched on: from the next cycle. Switched off: the steps stop, the
+  ** atomic phase walks what the prewalk did not reach.
+  */
+  gwfin(a)->pwflags = (uint8_t)(flags & (LJ_GW_PW_UDATA|LJ_GW_PW_GRAYAGAIN));
+  return gwfin(a)->pwflags;
+}
+
+/* -- GlobalWar: before the atomic phase (see lj_gc.h) -------------------- */
+
+#define GC_GW_ATOMIC	(~(size_t)0)	/* Nothing to do: the atomic phase. */
+
+/* Drain the 2nd chance list into the (empty) gray list: the propagate steps
+** traverse those tables again (they turn black, a later write puts them back
+** on grayagain). Threads go back on grayagain when traversed.
+*/
+static void gc_gw_drain(global_State *g, GCgwfin *f)
+{
+  if (LJ_UNLIKELY(gc_gw_stats != NULL) && gc_gw_g == g) {  /* Diagnostics. */
+    GCobj *o;
+    for (o = gcref(g->gc.grayagain); o; o = gcref(o->gch.gclist))
+      if (o->gch.gct == ~LJ_TTAB) f->gadrained++;
+  }
+  lj_assertG(gcref(g->gc.gray) == NULL, "drain into a non-empty gray list");
+  setgcrefr(g->gc.gray, g->gc.grayagain);
+  setgcrefnull(g->gc.grayagain);
+  f->gadrains++;
+  f->ga_drains++;
+}
+
+/* GCSpropagate with the gray list empty. Returns the cost of a step, or
+** GC_GW_ATOMIC when the atomic phase may run.
+*/
+static size_t gc_gw_preatomic(global_State *g)
+{
+  GCudata *a = gc_gw_anchor(g);
+  GCgwfin *f;
+  if (a == NULL) return GC_GW_ATOMIC;
+  f = gwfin(a);
+  if ((f->pwflags & LJ_GW_PW_GRAYAGAIN) && f->gadrains == 0) {
+    gc_gw_drain(g, f);  /* Before the prewalk: it sees what they reach. */
+    return 0;
+  }
+  if (f->pwstate == LJ_GW_PWS_WALK) {
+    if (f->mode && (f->pwflags & LJ_GW_PW_UDATA) && !f->dirty) {
+      size_t c = gc_gw_prewalk(g, a);
+      if (f->pwstate == LJ_GW_PWS_DONE) {
+	f->pw_walked += f->pwwalked;
+	f->pw_checked += f->pwchecked;
+      }
+      return c;
+    }
+    /* Switched off or dirty: stop, the atomic phase walks the rest. */
+  }
+  if ((f->pwflags & LJ_GW_PW_GRAYAGAIN) && f->gadrains == 1) {
+    gc_gw_drain(g, f);  /* Right before atomic: the tables written since. */
+    return 0;
+  }
+  return GC_GW_ATOMIC;
 }
 
 /* -- Collector ----------------------------------------------------------- */
@@ -1395,6 +1706,10 @@ static size_t gc_onestep(lua_State *L)
   case GCSpropagate:
     if (gcref(g->gc.gray) != NULL)
       return propagatemark(g);  /* Propagate one gray object. */
+    {  /* GlobalWar: the prewalk and the grayagain drains (lj_gc.h). */
+      size_t c = gc_gw_preatomic(g);
+      if (c != GC_GW_ATOMIC) return c;
+    }
     g->gc.state = GCSatomic;  /* End of mark phase. */
     return 0;
   case GCSatomic:
@@ -1520,9 +1835,14 @@ void lj_gc_fullgc(lua_State *L)
     setgcrefnull(g->gc.weak);
     g->gc.state = GCSsweepstring;  /* Fast forward to the sweep phase. */
     g->gc.sweepstr = 0;
-    {  /* GlobalWar: a sweep without atomic(): its finobj cursor anew. */
+    {  /* GlobalWar: a sweep without atomic(): its finobj cursor anew, the
+       ** prewalk of the cycle ends (the next cycle starts it anew).
+       */
       GCudata *a = gc_gw_anchor(g);
-      if (a) gwfin(a)->sweepins = &a->nextgc;
+      if (a) {
+	gwfin(a)->sweepins = &a->nextgc;
+	gwfin(a)->pwstate = LJ_GW_PWS_IDLE;
+      }
     }
   }
   while (g->gc.state == GCSsweepstring || g->gc.state == GCSsweep)

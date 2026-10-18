@@ -135,6 +135,15 @@ typedef struct luaJIT_gw_atomic {
 				** them. */
   size_t fin_kept;		/* Of them unreachable: kept for a cycle. */
   size_t fin_mts;		/* Metatables without __gc watched. */
+  /* Before this phase (luaJIT_gw_prewalk). separate.objs includes pw_tail. */
+  int pw_state;			/* 0: no prewalk, 1: unfinished, 2: finished. */
+  size_t pw_walked;		/* Udata the prewalk walked. */
+  size_t pw_checked;		/* Of them marked: skipped by this phase. */
+  size_t pw_tail;		/* Checked udata the prewalk did not reach: walked
+				** here. */
+  size_t ga_drains;		/* grayagain drained into the propagate steps. */
+  size_t ga_drained;		/* Tables drained (ga_tabs: those left for this
+				** phase). */
 } luaJIT_gw_atomic;
 
 /* st != NULL: record every atomic phase of the state of L into *st (time by
@@ -162,6 +171,7 @@ typedef struct luaJIT_gw_heap {
   size_t ud_finobj, ud_plain;	/* Live userdata in each list. */
   size_t ud_pending;		/* Plain ones with __gc, the sweep moves them. */
   size_t fin_mts;		/* Metatables without __gc watched. */
+  size_t ud_checked;		/* Of ud_finobj: in the checked list (prewalk). */
 } luaJIT_gw_heap;
 
 /* Every live userdata: p = its payload (as lua_topointer()), bytes = its
@@ -226,7 +236,7 @@ LUA_API lua_CFunction luaJIT_gw_cfunc(lua_State *L, const lua_Debug *ar);
 **   A userdata without __gc reachable only from the dead ones with __gc is
 **   not flagged finalized, so it stays in weak values until it dies itself.
 ** mode < 0: query. Returns the mode now, -1 = out of memory (stays off).
-** The first switch on adds two hidden userdata to the state (not counted by
+** The first switch on adds three hidden userdata to the state (not counted by
 ** luaJIT_gw_census). The engine checks LUAJIT_GW_FINOBJ.
 */
 #define LUAJIT_GW_FINOBJ	1
@@ -247,8 +257,35 @@ typedef struct luaJIT_gw_finobj_info {
   unsigned long long watched;	/* Metatables put on watch. */
   unsigned long long kept;	/* PENDING ones dead at atomic, kept a cycle. */
   unsigned long long oom;	/* Out of memory: all walked instead. */
+  int pw_flags;			/* luaJIT_gw_prewalk() flags now. */
+  unsigned long long pw_cycles;	/* Prewalks finished before atomic. */
+  unsigned long long pw_walked;	/* Udata walked by them. */
+  unsigned long long pw_checked;  /* Of them: marked, skipped by atomic. */
+  unsigned long long pw_merges;	/* Checked list merged back (mode 0, a walk
+				** of all udata, lua_close). */
+  unsigned long long ga_drains;	/* grayagain drains. */
 } luaJIT_gw_finobj_info;
 
 LUA_API void luaJIT_gw_finobj_stats(lua_State *L, luaJIT_gw_finobj_info *out);
+
+/* luaJIT_gw_prewalk(): work moved out of the atomic phase of the GC into
+** the incremental steps, with luaJIT_gw_finobj() on (its anchors). Off by
+** default. Flags (from the next GC cycle):
+** - LUAJIT_GW_PREWALK_UDATA: when the propagate phase is done, the userdata
+**   with __gc are walked in small steps, the marked (live) ones go to a
+**   checked list, so the atomic phase walks only the dead ones and the ones
+**   marked late (finobj mode 1 only). The finalization order stays as
+**   upstream: reverse order of creation.
+** - LUAJIT_GW_PREWALK_GRAYAGAIN: before and after that walk, the tables
+**   written behind the barrier (grayagain) are traversed again in small
+**   steps; the atomic phase traverses only the ones written since.
+** flags < 0: query. Returns the flags now, -1: no anchors (call
+** luaJIT_gw_finobj(L, 1) first). The engine checks LUAJIT_GW_PREWALK.
+*/
+#define LUAJIT_GW_PREWALK		1
+#define LUAJIT_GW_PREWALK_UDATA		1
+#define LUAJIT_GW_PREWALK_GRAYAGAIN	2
+
+LUA_API int luaJIT_gw_prewalk(lua_State *L, int flags);
 
 #endif

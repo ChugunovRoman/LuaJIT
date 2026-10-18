@@ -52,12 +52,13 @@ enum {
 /* -- GlobalWar: a separate list of userdata with __gc (a local patch) ----
 **
 ** luaJIT_gw_finobj(L, 1) (luajit.h) splits the userdata list after the main
-** thread in two by two anchors (fixed userdata, never visible to Lua):
+** thread by anchors (fixed userdata, never visible to Lua; the checked list
+** between B and C is the prewalk's, see below):
 **
-**   mainthread -> A -> [finobj: udata with __gc] -> B -> [plain udata] -> NULL
+**   mainthread -> A -> [finobj: udata with __gc] -> B -> C -> [plain] -> NULL
 **
 ** A stays right after the main thread, so it is found in O(1); its payload
-** is GCgwfin. New userdata go to the head of the plain list (after B). A
+** is GCgwfin. New userdata go to the head of the plain list (after C). A
 ** userdata that gets a metatable with __gc moves to the finobj list: in O(1)
 ** when it is the head of the plain list (lua_newuserdata + lua_setmetatable),
 ** otherwise it is flagged PENDING and the next sweep moves it. The atomic
@@ -71,6 +72,26 @@ enum {
 ** upstream), both lists stay sorted newest first. A userdata moved into the
 ** finobj list later (sweep, full walk) is inserted by its stamp, and a walk
 ** of both lists (mode 0, the full walk, lua_close) merges them by stamp.
+**
+** Prewalk (luaJIT_gw_prewalk): the finobj list has a second part, the
+** checked list between anchors B and C:
+**
+**   mainthread -> A -> [finobj] -> B -> [checked] -> C -> [plain] -> NULL
+**
+** Both parts are sorted newest first. When the gray list is empty at the end
+** of the propagate phase, a few steps (GCPREWALKMAX udata each) walk both
+** parts merged by stamp: a marked (black) or finalized udata goes to the
+** checked part, any other one to the finobj part. A userdata never turns
+** white again before the atomic phase (userdata are never gray, barriers
+** only mark), so the atomic phase walks only the finobj part (the dead ones
+** and those marked late) plus the checked part the prewalk did not reach.
+** The merged walk keeps both parts sorted, so the dead are queued for __gc
+** in the order upstream queues them. Every other walk (mode 0, a full walk,
+** lua_close) merges the checked part back into the finobj part first.
+** The same steps may drain the 2nd chance list (grayagain) into the gray
+** list once before and once after the prewalk: the tables written behind
+** the barrier are traversed again in small steps, and the atomic phase is
+** left with the ones written since then.
 */
 #define LJ_GW_UDTYPE_ANCHOR	UDTYPE__MAX	/* udtype of the anchors. */
 #define LJ_GW_UD_FINOBJ		0x01	/* GCudata.unused2: in the finobj list. */
@@ -82,11 +103,28 @@ enum {
 #define gc_gw_newer(x, y) \
   ((int32_t)(gwudstamp(gco2ud(x)) - gwudstamp(gco2ud(y))) > 0)
 
+/* GCgwfin.pwflags (luaJIT_gw_prewalk). */
+#define LJ_GW_PW_UDATA		0x01	/* Prewalk of the finobj list. */
+#define LJ_GW_PW_GRAYAGAIN	0x02	/* Drain grayagain before atomic. */
+/* GCgwfin.pwstate: the prewalk of this cycle. */
+#define LJ_GW_PWS_IDLE		0	/* Not run (pwk is not valid). */
+#define LJ_GW_PWS_WALK		1	/* Walking (pwu/pwk/pwfront valid). */
+#define LJ_GW_PWS_DONE		2	/* Both parts walked. */
+
 typedef struct GCgwfin {
   GCudata *b;		/* Anchor B: the end of the finobj list. */
   uint8_t mode;		/* 0: off (atomic walks all udata), 1: on. */
   uint8_t dirty;	/* 1: the plain list may hold udata with __gc. */
-  uint8_t unused[2];
+  uint8_t pwflags;	/* LJ_GW_PW_*: what runs before the atomic phase. */
+  uint8_t pwstate;	/* LJ_GW_PWS_*. */
+  GCudata *c;		/* Anchor C: the end of the checked list. */
+  GCRef *pwu, *pwk;	/* Prewalk: the next udata in each part. */
+  uint32_t pwfront;	/* Prewalk: the stamp of the last udata walked. */
+  uint8_t gadrains;	/* grayagain drained this cycle (0..2). */
+  uint8_t unused[3];
+  size_t pwwalked;	/* This cycle: udata walked by the prewalk. */
+  size_t pwchecked;	/* Of them: marked or finalized (checked list). */
+  size_t gadrained;	/* Tables drained (counted with gcstats only). */
   MSize nmt, szmt;	/* Watched metatables (without __gc). */
   GCtab **mt;
   MSize npend, szpend;	/* Udata flagged PENDING since the last atomic. */
@@ -103,9 +141,16 @@ typedef struct GCgwfin {
   uint64_t watched;	/* Metatables put on watch. */
   uint64_t kept;	/* PENDING udata unreachable at atomic, kept a cycle. */
   uint64_t oom;		/* Out of memory for the vectors: walk all instead. */
+  uint64_t pw_cycles;	/* Prewalks finished before the atomic phase. */
+  uint64_t pw_walked;	/* Udata walked by the prewalks. */
+  uint64_t pw_checked;	/* Of them: to the checked list. */
+  uint64_t pw_merges;	/* Checked list merged back (mode 0, full walk). */
+  uint64_t ga_drains;	/* grayagain drains. */
 } GCgwfin;
 
 #define gwfin(a)	((GCgwfin *)uddata(a))
+/* The head of the plain list: new and finalized userdata go there. */
+#define gc_gw_plainhead(f)	(&(f)->c->nextgc)
 /* Anchor A of the state or NULL. */
 #define gc_gw_anchor(g) \
   (gcref(mainthread(g)->nextgc) && \
